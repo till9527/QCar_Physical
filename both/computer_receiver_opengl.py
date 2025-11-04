@@ -216,7 +216,7 @@ def handle_client(conn, addr, model):
 # --- MODIFIED: Main application logic using OpenCV ---
 def main():
     print("Loading YOLOv8 model...")
-    model_path = r"C:\Users\user\Documents\Frank\multi_agent\Actual QCar Video.v1i.yolov8\physical_model\weights\best.pt"
+    model_path = "../model/best.pt"
     model = YOLO(model_path)
     print("Model loaded.")
 

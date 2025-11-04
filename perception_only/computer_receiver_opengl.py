@@ -84,7 +84,7 @@ def handle_client(conn, addr, model):
                 class_name = model.names[int(box.cls[0].item())]
                 xwyh = box.xywh[0]
                 width = xwyh[2].item()
-                #print(width)
+                # print(width)
                 if (
                     class_name == "red_light"
                     and (time.time() - last_start_time > RED_LIGHT_COOLDOWN)
@@ -99,7 +99,6 @@ def handle_client(conn, addr, model):
                 print(f"--- COMMAND to {addr}: Sending STOP ---")
                 conn.sendall(b"STOP")
                 car_state = "STOP"
-                
 
             elif found_green_light and car_state == "STOP":
                 print(f"--- COMMAND to {addr}: Sending GO ---")
@@ -125,7 +124,7 @@ def handle_client(conn, addr, model):
 # --- MODIFIED: Main application logic using OpenCV ---
 def main():
     print("Loading YOLOv8 model...")
-    model_path = r"C:\Users\user\Documents\Frank\multi_agent\model\best.pt"
+    model_path = "../model/best.pt"
     model = YOLO(model_path)
     print("Model loaded.")
 
