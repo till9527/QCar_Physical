@@ -6,9 +6,12 @@ import numpy as np
 import time
 import cv2  # MODIFIED: Using OpenCV for display
 import threading
-
+from pathlib import Path
 from ultralytics import YOLO
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+# This joins that directory path with your model path
+MODEL_PATH = SCRIPT_DIR.parent / "model" / "best.pt"
 # --- Settings ---
 HOST = "0.0.0.0"
 PORT = 8080
@@ -124,8 +127,7 @@ def handle_client(conn, addr, model):
 # --- MODIFIED: Main application logic using OpenCV ---
 def main():
     print("Loading YOLOv8 model...")
-    model_path = "../model/best.pt"
-    model = YOLO(model_path)
+    model = YOLO(MODEL_PATH)
     print("Model loaded.")
 
     # --- Listener thread setup (Unchanged) ---

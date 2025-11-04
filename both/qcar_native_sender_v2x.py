@@ -372,12 +372,7 @@ else:
         initialPose = [0, 0, 0]
 
     # --- V2X ADDITION: Set traffic light timing ---
-    print("Setting traffic light sequences...")
-    for traffic_light in traffic_lights:
-        try:
-            traffic_light.timed(red=20, yellow=1, green=4)
-        except Exception as e:
-            print(f"Could not set timing for a traffic light: {e}")
+
     # --- End V2X ADDITION ---
 
     calibrate = "y" in input("Do you want to recalibrate? (y/n): ")
