@@ -7,7 +7,8 @@ import time
 import select
 import signal
 import numpy as np
-
+import cv2
+import sys
 
 # --- Imports from vehicle_control_with_camera.py ---
 from pal.products.qcar import (
@@ -24,14 +25,14 @@ from hal.products.mats import SDCSRoadMap
 from pal.products.traffic_light import TrafficLight
 
 # --- Networking Setup ---
-COMPUTER_IP = "192.168.2.11"
+COMPUTER_IP = "192.168.2.12"
 PORT = 8080
 
 
 # --- Camera Settings ---
 CAMERA_ID = "3"
-IMAGE_WIDTH = 320
-IMAGE_HEIGHT = 240
+IMAGE_WIDTH = 640
+IMAGE_HEIGHT = 480
 FRAME_RATE = 30
 
 # --- Controller Settings ---
@@ -46,7 +47,7 @@ K_stanley = 1
 nodeSequence = [10, 4, 20, 10]
 
 # --- V2X ADDITION: Traffic Light & Geofencing Setup ---
-TRAFFIC_LIGHT_IPS = ["192.168.2.15", "192.168.2.16"]
+TRAFFIC_LIGHT_IPS = ["192.168.2.18", "192.168.2.19"]
 traffic_lights = [TrafficLight(ip) for ip in TRAFFIC_LIGHT_IPS]
 
 # Geofencing areas
@@ -280,6 +281,7 @@ def control_thread_func(initialPose, waypointSequence, calibrationPose, calibrat
 
                         if is_inside:
                             # Check if we have a status for this light
+                            # print("inside geofence")
                             if i < len(current_statuses):
                                 traffic_light_status = current_statuses[i]
 
@@ -329,22 +331,14 @@ def control_thread_func(initialPose, waypointSequence, calibrationPose, calibrat
                 # --- V2X MODIFICATION: Combined Speed Control Logic ---
 
                 # 1. Get computer's desired state
-                computer_go_flag = False
+                
                 with car_state_lock:
                     if car_state == "GO":
-                        computer_go_flag = True
+                        target_speed = v_ref
+                    if car_state=="STOP":
+                        target_speed=0.0
 
-                # 2. V2X state is v2x_go_flag (calculated above)
-
-                # 3. Combine: Must have "GO" from computer AND V2X
-                target_speed = 0.0
-                if computer_go_flag and v2x_go_flag:
-                    target_speed = v_ref
-                elif not computer_go_flag:
-                    print("Control: Computer state is STOP", end="\r")
-                elif not v2x_go_flag:
-                    print(f"Control: V2X state is STOP", end="\r")
-
+                
                 u = speedController.update(v, target_speed, dt)
                 # --- End V2X MODIFICATION ---
 
@@ -433,7 +427,15 @@ else:
                     local_frame = np.ascontiguousarray(latest_frame)
 
             if local_frame is not None:
-                frame_bytes = local_frame.tobytes()
+                # CHANGED: Compress frame to JPEG
+                # Quality goes from 0 to 100. 80 is a good balance of speed/quality.
+                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                _, encoded_img = cv2.imencode(".jpg", local_frame, encode_param)
+
+                data = np.array(encoded_img)
+                frame_bytes = data.tobytes()
+
+                # Send the length of the COMPRESSED data
                 message_header = struct.pack(">L", len(frame_bytes))
                 client_socket.sendall(message_header)
                 client_socket.sendall(frame_bytes)
@@ -462,3 +464,4 @@ else:
             client_socket.close()
 
         print("Shutdown complete.")
+        sys.exit(0)

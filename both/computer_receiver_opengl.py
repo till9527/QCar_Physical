@@ -12,8 +12,8 @@ from ultralytics import YOLO
 # --- Settings ---
 HOST = "0.0.0.0"
 PORT = 8080
-BASE_WIDTH = 320
-BASE_HEIGHT = 240
+BASE_WIDTH = 640
+BASE_HEIGHT = 480
 SCRIPT_DIR = Path(__file__).resolve().parent
 # This joins that directory path with your model path
 MODEL_PATH = SCRIPT_DIR.parent / "model" / "best.pt"
@@ -21,15 +21,6 @@ MODEL_PATH = SCRIPT_DIR.parent / "model" / "best.pt"
 # This allows the main thread to access frames from all worker threads.
 latest_frames = {}
 frames_lock = threading.Lock()
-
-from pal.products.traffic_light import TrafficLight
-
-
-TRAFFIC_LIGHT_IPS = ["192.168.2.15", "192.168.2.16"]
-traffic_lights = [TrafficLight(ip) for ip in TRAFFIC_LIGHT_IPS]
-
-for traffic_light in traffic_lights:
-    traffic_light.timed(red=20, yellow=5, green=10)
 
 
 # --- Helper function (Unchanged) ---
@@ -70,6 +61,8 @@ def handle_client(conn, addr, model):
     # NEW: Cleaned-up state variables for stop signs
     is_stopped_for_sign = False  # Is the car *currently* stopped for a sign?
     stop_sign_start_time = 0  # Time the last STOP command was sent
+    yield_sign_start_time = 0
+    is_stopped_for_yield = False
     STOP_SIGN_WAIT_TIME_S = 5.0
     STOP_SIGN_COOLDOWN_S = 10.0  # Time to ignore signs *after stopping*
 
@@ -91,11 +84,16 @@ def handle_client(conn, addr, model):
             frame_data = receive_all(conn, msg_size)
             if not frame_data:
                 break
-            frame = np.frombuffer(frame_data, dtype=np.uint8).reshape(
-                (BASE_HEIGHT, BASE_WIDTH, 3)
-            )
 
-            results = model(frame, verbose=False, conf=0.3)
+            # CHANGED: Decode the JPEG byte array back to an image
+            np_arr = np.frombuffer(frame_data, dtype=np.uint8)
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+            # Safety check in case decoding fails
+            if frame is None:
+                continue
+
+            results = model(frame, verbose=False, conf=0.65)
             annotated_frame = results[0].plot()
 
             # --- 2. Process Detections ---
@@ -104,6 +102,7 @@ def handle_client(conn, addr, model):
             found_green_light = False
             found_red_light = False
             found_stop_sign = False
+            found_yield_sign = False
 
             for box in results[0].boxes:
                 class_name = model.names[int(box.cls[0].item())]
@@ -122,7 +121,8 @@ def handle_client(conn, addr, model):
 
                 if class_name == "stop_sign" and width > STOP_SIGN_MIN_WIDTH_THRESHOLD:
                     found_stop_sign = True
-
+                if class_name == "yield_sign" and width > STOP_SIGN_MIN_WIDTH_THRESHOLD:
+                    found_yield_sign = True
             # --- 3. Detection-Based Action Logic ---
             # This block handles actions based on *seeing* an object
             # NEW: This logic is now a clean if/elif chain for priority
@@ -167,6 +167,20 @@ def handle_client(conn, addr, model):
                 car_state = "STOP"
                 is_stopped_for_sign = True  # We are now in a stop-sign-wait
                 stop_sign_start_time = current_time  # Record the time we stopped
+            elif (
+                found_yield_sign
+                and car_state == "GO"  # NEW: Only stop if we are moving
+                and not is_stopped_for_sign  # And not already stopped for a sign
+                and not is_stopped_light  # Red light has priority
+                and (
+                    current_time - yield_sign_start_time > STOP_SIGN_COOLDOWN_S
+                )  # And 10s cooldown has passed
+            ):
+                print(f"--- COMMAND to {addr}: Sending STOP (Yield Sign) ---")
+                conn.sendall(b"STOP")
+                car_state = "STOP"
+                is_stopped_for_yield = True  # We are now in a stop-sign-wait
+                yield_sign_start_time = current_time  # Record the time we stopped
 
             # --- 4. Timeout-Based Action Logic ---
             # NEW: This block is separate and handles the 5-second wait
@@ -184,20 +198,19 @@ def handle_client(conn, addr, model):
                 conn.sendall(b"GO")
                 car_state = "GO"
                 is_stopped_for_sign = False
+
             if (
-                is_stopped_light  # We are stopped for a sign
+                is_stopped_for_yield  # We are stopped for a sign
                 and car_state == "STOP"  # NEW: We are currently stopped
                 and (
-                    current_time - last_stop_light_time > RED_LIGHT_WAIT_TIME
+                    current_time - yield_sign_start_time > 3
                 )  # And 5 seconds have passed
-                and not is_stopped_for_sign  # And no red light is present
+                and not is_stopped_light  # And no red light is present
             ):
-                print(f"--- COMMAND to {addr}: Sending GO (Red Light Wait is Over) ---")
+                print(f"--- COMMAND to {addr}: Sending GO (Yield Sign Wait Over) ---")
                 conn.sendall(b"GO")
                 car_state = "GO"
-                is_stopped_light = False  # We are no longer waiting for the sign
-                # stop_sign_start_time now holds the time we stopped,
-                # which correctly enforces the 10-second cooldown in block 3.C
+                is_stopped_for_yield = False
 
             # --- 5. Update Shared Frame ---
             with frames_lock:

@@ -7,7 +7,7 @@ import time
 import select
 import signal
 import numpy as np
-
+import cv2
 
 # --- Imports from vehicle_control_with_camera.py ---
 from pal.products.qcar import (
@@ -21,14 +21,14 @@ from hal.content.qcar_functions import QCarEKF
 from hal.products.mats import SDCSRoadMap
 
 # --- Networking Setup ---
-COMPUTER_IP = "192.168.2.14"
+COMPUTER_IP = "192.168.2.12"
 PORT = 8080
 
 
 # --- Camera Settings ---
 CAMERA_ID = "3"
-IMAGE_WIDTH = 320
-IMAGE_HEIGHT = 240
+IMAGE_WIDTH = 640
+IMAGE_HEIGHT = 480
 FRAME_RATE = 30
 
 # --- Controller Settings ---
@@ -281,7 +281,14 @@ else:
                     local_frame = np.ascontiguousarray(latest_frame)
 
             if local_frame is not None:
-                frame_bytes = local_frame.tobytes()
+                # Compression Logic
+                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                _, encoded_img = cv2.imencode(".jpg", local_frame, encode_param)
+
+                data = np.array(encoded_img)
+                frame_bytes = data.tobytes()
+
+                # Send the length of the COMPRESSED data
                 message_header = struct.pack(">L", len(frame_bytes))
                 client_socket.sendall(message_header)
                 client_socket.sendall(frame_bytes)
