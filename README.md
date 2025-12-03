@@ -11,3 +11,5 @@ For deploying the code, use winscp to connect to the qcar, and then a sudo pytho
 
 
 Because the position of the traffic lights for v2x have been hard coded, they should resemble the positions in the attached image
+
+If you get an error saying that the video format is unsupported, just restart the QCar. Unfortunately this is an error that seems to occur after a running the code a few times.
