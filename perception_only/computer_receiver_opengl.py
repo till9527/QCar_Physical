@@ -69,9 +69,10 @@ def handle_client(conn, addr, model):
     # --- Red light state ---
     is_stopped_light = False
     last_stop_light_time = 0
+    last_green_light_seen_time = 0
 
     # NEW: Use the width threshold from your original file
-    STOP_SIGN_MIN_WIDTH_THRESHOLD = 22
+    STOP_SIGN_MIN_WIDTH_THRESHOLD = 32
     RED_LIGHT_WAIT_TIME = 20
 
     try:
@@ -109,15 +110,30 @@ def handle_client(conn, addr, model):
                 xwyh = box.xywh[0]
                 width = xwyh[2].item()
                 height = xwyh[3].item()
+                y = xwyh[1].item()
                 # if class_name == "red light":
                 #     # print("Width: ", width)
                 #     # print("Height: ", height)
 
-                if class_name == "red_light" and width > 8:
+                if class_name == "red_light" and width > 13 and height < 50 and y < 200:
                     found_red_light = True
 
-                if class_name == "green_light" and width > 8:
+                if (
+                    class_name == "yellow_light"
+                    and width > 13
+                    and height < 50
+                    and y < 200
+                ):
+                    found_red_light = True
+
+                if (
+                    class_name == "green_light"
+                    and width > 13
+                    and height < 50
+                    and y < 200
+                ):
                     found_green_light = True
+                    last_green_light_seen_time = current_time
 
                 if class_name == "stop_sign" and width > STOP_SIGN_MIN_WIDTH_THRESHOLD:
                     found_stop_sign = True
@@ -132,6 +148,7 @@ def handle_client(conn, addr, model):
                 found_red_light
                 and car_state == "GO"  # NEW: Only stop if we're not already stopped
                 and (current_time - last_start_time > RED_LIGHT_COOLDOWN)
+                and (current_time - last_green_light_seen_time > 2)
             ):
                 print(f"--- COMMAND to {addr}: Sending STOP (Red Light) ---")
                 conn.sendall(b"STOP")
