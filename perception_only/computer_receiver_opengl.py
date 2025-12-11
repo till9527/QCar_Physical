@@ -70,6 +70,9 @@ def handle_client(conn, addr, model):
     is_stopped_light = False
     last_stop_light_time = 0
     last_green_light_seen_time = 0
+    found_pedestrian = False
+    is_stopped_pedestrian = False
+    last_pedestrian_seen_time = 0
 
     # NEW: Use the width threshold from your original file
     STOP_SIGN_MIN_WIDTH_THRESHOLD = 32
@@ -94,7 +97,7 @@ def handle_client(conn, addr, model):
             if frame is None:
                 continue
 
-            results = model(frame, verbose=False, conf=0.65)
+            results = model(frame, verbose=False, conf=0.3)
             annotated_frame = results[0].plot()
 
             # --- 2. Process Detections ---
@@ -111,9 +114,19 @@ def handle_client(conn, addr, model):
                 width = xwyh[2].item()
                 height = xwyh[3].item()
                 y = xwyh[1].item()
-                # if class_name == "red light":
-                #     # print("Width: ", width)
-                #     # print("Height: ", height)
+                x = xwyh[0].item()
+                if class_name == "pedestrian":
+                    last_pedestrian_seen_time = current_time
+
+                if (
+                    class_name == "pedestrian"
+                    and (width > 50 or height > 100)
+                    and 275 < x < 425
+                ):
+                    found_pedestrian = True
+
+                if class_name == "pedestrian" and not 275 < x < 425:
+                    found_pedestrian = False
 
                 if class_name == "red_light" and width > 13 and height < 50 and y < 200:
                     found_red_light = True
@@ -144,7 +157,26 @@ def handle_client(conn, addr, model):
             # NEW: This logic is now a clean if/elif chain for priority
 
             # A. Red Light Stop
-            if (
+            if found_pedestrian and car_state == "GO":
+                print(f"--- COMMAND to {addr}: Sending STOP (Pedestrian) ---")
+                conn.sendall(b"STOP")
+                car_state = "STOP"
+                is_stopped_pedestrian = True
+
+            elif not found_pedestrian and car_state == "STOP" and is_stopped_pedestrian:
+                print(f"--- COMMAND to {addr}: Sending Go (Pedestrian out of way) ---")
+                conn.sendall(b"GO")
+                car_state = "GO"
+                is_stopped_pedestrian = False
+            elif is_stopped_pedestrian and (
+                current_time - last_pedestrian_seen_time > 5
+            ):
+                print(f"--- COMMAND to {addr}: Sending Go (Pedestrian out of way) ---")
+                conn.sendall(b"GO")
+                car_state = "GO"
+                is_stopped_pedestrian = False
+
+            elif (
                 found_red_light
                 and car_state == "GO"  # NEW: Only stop if we're not already stopped
                 and (current_time - last_start_time > RED_LIGHT_COOLDOWN)

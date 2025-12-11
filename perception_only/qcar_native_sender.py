@@ -21,7 +21,7 @@ from hal.content.qcar_functions import QCarEKF
 from hal.products.mats import SDCSRoadMap
 
 # --- Networking Setup ---
-COMPUTER_IP = "192.168.2.12"
+COMPUTER_IP = "192.168.2.11"
 PORT = 8080
 
 
