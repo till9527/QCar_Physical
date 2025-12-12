@@ -1,68 +1,102 @@
-# qcar_sender_with_control_and_v2x.py - Runs ON THE QCAR
-
-import socket
-import struct
-import threading
-import time
-import select
+import os
 import signal
 import numpy as np
+import threading
+from threading import Thread
+import time
+import socket
+import struct
+import math
+import select
 import cv2
-import sys
 
-# --- Imports from vehicle_control_with_camera.py ---
-from pal.products.qcar import (
-    QCar,
-    QCarGPS,
-    IS_PHYSICAL_QCAR,
-)
-from pal.utilities.vision import Camera2D
+# --- Quanser Imports ---
+from pal.products.qcar import QCar, QCarGPS, IS_PHYSICAL_QCAR
 from pal.utilities.math import wrap_to_pi
 from hal.content.qcar_functions import QCarEKF
 from hal.products.mats import SDCSRoadMap
+from pal.utilities.vision import Camera2D
 
-# --- V2X ADDITION ---
+# V2X Import
 from pal.products.traffic_light import TrafficLight
 
-# --- Networking Setup ---
-COMPUTER_IP = "192.168.2.12"
+# ================= CONFIGURATION =================
+# --- Network (PC Connection) ---
+COMPUTER_IP = "192.168.2.11"  # <--- CONFIRM THIS IS YOUR PC IP
 PORT = 8080
 
-
-# --- Camera Settings ---
+# --- Camera ---
 CAMERA_ID = "3"
 IMAGE_WIDTH = 640
 IMAGE_HEIGHT = 480
 FRAME_RATE = 30
 
-# --- Controller Settings ---
-tf = 6000
+# --- V2X / Traffic Lights ---
+TRAFFIC_LIGHTS_CONFIG = [
+    {"id": 1, "ip": "192.168.2.15", "location": [2.113, 0.204], "yaw_deg": 0},
+    {"id": 2, "ip": "192.168.2.13", "location": [-1.909, 0.738], "yaw_deg": 180},
+]
+
+# --- Controller ---
+tf = 600
 startDelay = 1
 controllerUpdateRate = 100
-v_ref = 0.5  # This is the cruise speed
+v_cruise = 0.5  # Target cruising speed
 K_p = 0.1
 K_i = 1
 enableSteeringControl = True
 K_stanley = 1
 nodeSequence = [10, 4, 20, 10]
 
-# --- V2X ADDITION: Traffic Light & Geofencing Setup ---
-TRAFFIC_LIGHT_IPS = ["192.168.2.18", "192.168.2.19"]
-traffic_lights = [TrafficLight(ip) for ip in TRAFFIC_LIGHT_IPS]
+# --- Global State ---
+is_running = True
+latest_frame = None
+frame_lock = threading.Lock()
 
-# Geofencing areas
-geofencing_threshold = 0.9
-traffic_light_positions = [(2.367, 0.9246), (-2.1248, 1.0018)]
+# Shared Control States
+car_state = "GO"  # From PC (Perception)
+car_state_lock = threading.Lock()
+
+traffic_light_statuses = ["UNKNOWN"] * len(TRAFFIC_LIGHTS_CONFIG)  # From V2X
 
 
-def generate_geofencing_areas(positions, threshold):
-    return [
-        {
-            "name": f"Traffic Light {i+1}",
-            "bounds": [(x - threshold, y - threshold), (x + threshold, y + threshold)],
-        }
-        for i, (x, y) in enumerate(positions)
-    ]
+# ================= V2X HELPER FUNCTIONS =================
+def generate_rotated_geofencing_areas(config_list):
+    """Generates geofencing bounds based on traffic light config."""
+    generated_areas = []
+    # Box dimensions relative to light: 0.3m to 0.8m in front, 0.6m wide
+    # Note: Using the specific offsets found in your Multi_V2X.py
+    local_corner_1 = (0.3, -0.5)
+    local_corner_2 = (-0.3, -1.0)
+
+    for light in config_list:
+        center_x = light["location"][0]
+        center_y = light["location"][1]
+        yaw_rad = math.radians(light["yaw_deg"])
+
+        cos_yaw = math.cos(yaw_rad)
+        sin_yaw = math.sin(yaw_rad)
+
+        # Rotate corners
+        def rotate(x, y):
+            return (x * cos_yaw - y * sin_yaw, x * sin_yaw + y * cos_yaw)
+
+        rx1, ry1 = rotate(local_corner_1[0], local_corner_1[1])
+        rx2, ry2 = rotate(local_corner_2[0], local_corner_2[1])
+
+        world_c1 = (center_x + rx1, center_y + ry1)
+        world_c2 = (center_x + rx2, center_y + ry2)
+
+        x_min, x_max = min(world_c1[0], world_c2[0]), max(world_c1[0], world_c2[0])
+        y_min, y_max = min(world_c1[1], world_c2[1]), max(world_c1[1], world_c2[1])
+
+        generated_areas.append(
+            {
+                "name": f"Traffic Light {light['id']}",
+                "bounds": [(x_min, y_min), (x_max, y_max)],
+            }
+        )
+    return generated_areas
 
 
 def is_inside_geofence(position, geofence):
@@ -70,38 +104,72 @@ def is_inside_geofence(position, geofence):
     return x_min <= position[0] <= x_max and y_min <= position[1] <= y_max
 
 
-geofencing_areas = generate_geofencing_areas(
-    traffic_light_positions, geofencing_threshold
-)
-# --- End V2X ADDITION ---
+# Initialize Geofences and Lights
+geofencing_areas = generate_rotated_geofencing_areas(TRAFFIC_LIGHTS_CONFIG)
+traffic_lights_objects = [TrafficLight(cfg["ip"]) for cfg in TRAFFIC_LIGHTS_CONFIG]
+
+# ================= THREADS =================
 
 
-# --- Global variables ---
-is_running = True
-latest_frame = None
-frame_lock = threading.Lock()
-# State variable from computer
-car_state = "GO"
-car_state_lock = threading.Lock()
+def traffic_lights_status_thread():
+    """Continuously fetches status from traffic lights over Wi-Fi."""
+    global traffic_light_statuses
+    status_map = {"1": "RED", "2": "YELLOW", "3": "GREEN"}
 
-# --- V2X ADDITION: Global state for traffic lights ---
-traffic_light_statuses = ["UNKNOWN"] * len(TRAFFIC_LIGHT_IPS)
-traffic_light_lock = threading.Lock()
-has_stopped_at = {geofence["name"]: False for geofence in geofencing_areas}
-# --- End V2X ADDITION ---
-
-
-# --- Shutdown Signal Handler ---
-def sig_handler(*args):
-    global is_running
-    is_running = False
-    print("\nShutdown signal received.")
+    while is_running:
+        new_statuses = []
+        for light in traffic_lights_objects:
+            try:
+                s = light.status()
+                new_statuses.append(status_map.get(s, "UNKNOWN"))
+            except:
+                new_statuses.append("UNKNOWN")
+        traffic_light_statuses = new_statuses
+        time.sleep(0.5)
 
 
-signal.signal(signal.SIGINT, sig_handler)
+def receiver_thread_func(sock):
+    """Receives STOP/GO commands from the PC (Perception)."""
+    global is_running, car_state
+    print("Receiver thread started...")
+    while is_running:
+        readable, _, _ = select.select([sock], [], [], 1.0)
+        if sock in readable:
+            try:
+                data = sock.recv(1024)
+                if data:
+                    command = data.decode("utf-8").strip()
+                    # We accept the last valid command
+                    if "STOP" in command:
+                        cmd = "STOP"
+                    elif "GO" in command:
+                        cmd = "GO"
+                    else:
+                        cmd = None
+
+                    if cmd:
+                        with car_state_lock:
+                            car_state = cmd
+                else:
+                    break
+            except:
+                break
+    print("Receiver thread stopped.")
 
 
-# --- Controller Classes (Unchanged) ---
+def camera_thread_func(camera):
+    """Reads camera frames."""
+    global latest_frame, is_running
+    while is_running:
+        if camera.read():
+            with frame_lock:
+                latest_frame = camera.imageData
+        time.sleep(1 / FRAME_RATE)
+
+
+# ================= CONTROLLERS =================
+
+
 class SpeedController:
     def __init__(self, kp=0, ki=0):
         self.maxThrottle = 0.3
@@ -125,8 +193,6 @@ class SteeringController:
         self.wpi = 0
         self.k = k
         self.cyclic = cyclic
-        self.p_ref = (0, 0)
-        self.th_ref = 0
 
     def update(self, p, th, speed):
         wp_1 = self.wp[:, np.mod(self.wpi, self.N - 1)]
@@ -135,20 +201,17 @@ class SteeringController:
         v_mag = np.linalg.norm(v)
         try:
             v_uv = v / v_mag
-        except ZeroDivisionError:
+        except:
             return 0
         tangent = np.arctan2(v_uv[1], v_uv[0])
         s = np.dot(p - wp_1, v_uv)
-        if s >= v_mag:
-            if self.cyclic or self.wpi < self.N - 2:
-                self.wpi += 1
+        if s >= v_mag and (self.cyclic or self.wpi < self.N - 2):
+            self.wpi += 1
         ep = wp_1 + v_uv * s
         ct = ep - p
         dir = wrap_to_pi(np.arctan2(ct[1], ct[0]) - tangent)
         ect = np.linalg.norm(ct) * np.sign(dir)
         psi = wrap_to_pi(tangent - th)
-        self.p_ref = ep
-        self.th_ref = tangent
         return np.clip(
             wrap_to_pi(psi + np.arctan2(self.k * ect, speed)),
             -self.maxSteeringAngle,
@@ -156,240 +219,106 @@ class SteeringController:
         )
 
 
-# --- Thread Functions ---
+# ================= MAIN CONTROL LOOP =================
 
 
-# --- V2X ADDITION: Functions and Thread for V2X ---
-def get_traffic_lights_status():
-    """
-    Fetch real-time status for multiple traffic lights.
-    """
-    try:
-        status_map = {"1": "RED", "2": "YELLOW", "3": "GREEN"}
-        statuses = []
-
-        for i, light in enumerate(traffic_lights):
-            status = light.status()
-            status_str = status_map.get(status, "UNKNOWN")
-            statuses.append(status_str)
-        return statuses
-    except Exception as e:
-        print(f"Error fetching traffic light statuses: {e}")
-        return ["UNKNOWN"] * len(traffic_lights)
-
-
-def traffic_lights_status_thread_func():
-    """Periodically polls traffic light statuses."""
-    global is_running, traffic_light_statuses
-    print("Traffic light status thread started...")
-    while is_running:
-        new_statuses = get_traffic_lights_status()
-        with traffic_light_lock:
-            traffic_light_statuses = new_statuses
-        time.sleep(1)  # Poll once per second
-    print("Traffic light status thread stopped.")
-
-
-# --- End V2X ADDITION ---
-
-
-# MODIFIED: Receiver thread now updates the shared state
-def receiver_thread_func(sock):
-    """Listens for commands from the computer and updates the shared car_state."""
-    global is_running, car_state
-    print("Receiver thread started...")
-    while is_running:
-        readable, _, _ = select.select([sock], [], [], 1.0)
-
-        if sock in readable:
-            try:
-                data = sock.recv(1024)
-                if data:
-                    command = data.decode("utf-8").strip()
-                    print(f"RECEIVED COMMAND: {command}")
-                    if command in ["GO", "STOP"]:
-                        with car_state_lock:
-                            car_state = command
-                else:
-                    print("Receiver thread: Connection closed by computer.")
-                    is_running = False
-                    break
-            except socket.error as e:
-                if is_running:
-                    print(f"Receiver thread: Socket error: {e}")
-                break
-    print("Receiver thread stopped.")
-
-
-def camera_thread_func(camera):
-    """Continuously reads from the camera into a global variable."""
-    global latest_frame, is_running
-    print("Camera thread started...")
-    while is_running:
-        if camera.read():
-            with frame_lock:
-                latest_frame = camera.imageData
-        time.sleep(1 / FRAME_RATE)
-    print("Camera thread stopped.")
-
-
-# --- V2X MODIFICATION: Control thread now reads V2X state AND computer state ---
 def control_thread_func(initialPose, waypointSequence, calibrationPose, calibrate):
-    """Runs the main vehicle control loop."""
-    global is_running, car_state, traffic_light_statuses, has_stopped_at
-    print("Control thread started...")
+    global is_running, car_state
 
     speedController = SpeedController(kp=K_p, ki=K_i)
-    if enableSteeringControl:
-        steeringController = SteeringController(waypoints=waypointSequence, k=K_stanley)
+    steeringController = SteeringController(waypoints=waypointSequence, k=K_stanley)
 
     qcar = QCar(readMode=1, frequency=controllerUpdateRate)
-    if enableSteeringControl:
-        ekf = QCarEKF(x_0=initialPose)
-        gps = QCarGPS(initialPose=calibrationPose, calibrate=calibrate)
-    else:
-        gps = memoryview(b"")
+    ekf = QCarEKF(x_0=initialPose)
+    gps = QCarGPS(initialPose=calibrationPose, calibrate=calibrate)
 
+    print("Control Loop Started.")
     with qcar, gps:
         t0 = time.time()
         t = 0
         delta = 0
+
         while (t < tf + startDelay) and is_running:
             tp = t
             t = time.time() - t0
             dt = t - tp
 
+            # 1. Read Sensors
             qcar.read()
+            if gps.readGPS():
+                y_gps = np.array([gps.position[0], gps.position[1], gps.orientation[2]])
+                ekf.update([qcar.motorTach, delta], dt, y_gps, qcar.gyroscope[2])
+            else:
+                ekf.update([qcar.motorTach, delta], dt, None, qcar.gyroscope[2])
 
-            # --- V2X MODIFICATION: V2X Logic ---
-            v2x_go_flag = True  # Assume we can go unless a light says no
-            # --- End V2X MODIFICATION ---
-
-            if enableSteeringControl:
-                if gps.readGPS():
-                    # --- V2X MODIFICATION: Check geofence and light status ---
-                    position = (gps.position[0], gps.position[1])
-
-                    # Read the global statuses safely
-                    with traffic_light_lock:
-                        current_statuses = traffic_light_statuses[
-                            :
-                        ]  # Make a local copy
-
-                    for i, geofence in enumerate(geofencing_areas):
-                        is_inside = is_inside_geofence(position, geofence["bounds"])
-
-                        if is_inside:
-                            # Check if we have a status for this light
-                            # print("inside geofence")
-                            if i < len(current_statuses):
-                                traffic_light_status = current_statuses[i]
-
-                                if (
-                                    traffic_light_status == "RED"
-                                    and not has_stopped_at[geofence["name"]]
-                                ):
-                                    v2x_go_flag = False  # STOP
-                                    has_stopped_at[geofence["name"]] = True
-                                    print(f"V2X: Stopping at {geofence['name']} (RED)")
-                                    car_state = "STOP"
-
-                                elif (
-                                    traffic_light_status == "GREEN"
-                                    and has_stopped_at[geofence["name"]]
-                                ):
-                                    v2x_go_flag = True  # RESUME
-                                    has_stopped_at[geofence["name"]] = False
-                                    print(
-                                        f"V2X: Resuming at {geofence['name']} (GREEN)"
-                                    )
-                                    car_state = "GO"
-
-                                # If already stopped and light is still red, we must remain stopped.
-
-                        if not is_inside and has_stopped_at[geofence["name"]]:
-                            has_stopped_at[geofence["name"]] = (
-                                False  # Reset stop state when leaving area
-                            )
-                    # --- End V2X MODIFICATION ---
-
-                    # Original EKF Update
-                    y_gps = np.array(
-                        [gps.position[0], gps.position[1], gps.orientation[2]]
-                    )
-                    ekf.update([qcar.motorTach, delta], dt, y_gps, qcar.gyroscope[2])
-                else:
-                    ekf.update([qcar.motorTach, delta], dt, None, qcar.gyroscope[2])
-
-                x, y, th = ekf.x_hat[0, 0], ekf.x_hat[1, 0], ekf.x_hat[2, 0]
-                p = np.array([x, y]) + np.array([np.cos(th), np.sin(th)]) * 0.2
+            x = ekf.x_hat[0, 0]
+            y = ekf.x_hat[1, 0]
+            th = ekf.x_hat[2, 0]
+            p = np.array([x, y]) + np.array([np.cos(th), np.sin(th)]) * 0.2
             v = qcar.motorTach
 
-            if t < startDelay:
-                u, delta = 0, 0
-            else:
-                # --- V2X MODIFICATION: Combined Speed Control Logic ---
+            # 2. Determine Speed Command
+            target_speed = 0.0
 
-                # 1. Get computer's desired state
-                
+            if t > startDelay:
+                # A. Check Perception Command (PC)
+                perception_says_go = False
                 with car_state_lock:
                     if car_state == "GO":
-                        target_speed = v_ref
-                    if car_state=="STOP":
-                        target_speed=0.0
+                        perception_says_go = True
 
-                
-                u = speedController.update(v, target_speed, dt)
-                # --- End V2X MODIFICATION ---
+                # B. Check V2X Command (Traffic Lights)
+                v2x_stop_override = False
+                current_pos = (x, y)
 
-                if enableSteeringControl:
-                    delta = steeringController.update(p, th, v)
+                for i, geofence in enumerate(geofencing_areas):
+                    if is_inside_geofence(current_pos, geofence["bounds"]):
+                        # We are at a light, check its status
+                        status = traffic_light_statuses[i]
+                        if status == "RED":
+                            v2x_stop_override = True
+                            # Optional: Print only once to avoid spam
+                            # print(f"V2X Stop: {geofence['name']} is RED")
+
+                # C. Final Logic: Go only if PC says GO *AND* V2X doesn't override
+                if perception_says_go and not v2x_stop_override:
+                    target_speed = v_cruise
                 else:
-                    delta = 0
+                    target_speed = 0.0
 
-            qcar.write(u, delta)
+                # D. Update Controllers
+                u = speedController.update(v, target_speed, dt)
+                delta = steeringController.update(p, th, v)
+                qcar.write(u, delta)
+            else:
+                qcar.write(0, 0)
 
-        qcar.write(0, 0)
+    qcar.write(0, 0)
     is_running = False
-    print("Control thread stopped.")
 
 
-# --- Main Program ---
-if not IS_PHYSICAL_QCAR:
-    print("This script is designed to run on the physical QCar.")
-else:
-    if enableSteeringControl:
-        roadmap = SDCSRoadMap(leftHandTraffic=False)
-        waypointSequence = roadmap.generate_path(nodeSequence)
-        initialPose = roadmap.get_node_pose(nodeSequence[0]).squeeze()
-    else:
-        initialPose = [0, 0, 0]
+# ================= EXECUTION =================
 
-    # --- V2X ADDITION: Set traffic light timing ---
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, lambda *args: globals().update(is_running=False))
 
-    # --- End V2X ADDITION ---
+    # Setup Map / GPS
+    roadmap = SDCSRoadMap(leftHandTraffic=False)
+    waypointSequence = roadmap.generate_path(nodeSequence)
+    initialPose = roadmap.get_node_pose(nodeSequence[0]).squeeze()
 
+    # Input for calibration
     calibrate = "y" in input("Do you want to recalibrate? (y/n): ")
     calibrationPose = [0, 2, -np.pi / 2]
 
-    # --- Initialize Threads ---
-    controlThread = None
-    cameraThread = None
-    receiverThread = None
-    # --- V2X ADDITION ---
-    trafficLightsThread = None
-    # --- End V2X ADDITION ---
-    client_socket = None
-    camera = None
-
+    # Initialize Threads
     try:
-        # 1. Connect to the computer
+        # Connect to PC
         client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        print(f"Connecting to computer at {COMPUTER_IP}:{PORT}...")
+        print(f"Connecting to PC at {COMPUTER_IP}:{PORT}...")
         client_socket.connect((COMPUTER_IP, PORT))
-        print("Connection established.")
+        print("Connected.")
 
-        # 2. Initialize Camera
         camera = Camera2D(
             cameraId=CAMERA_ID,
             frameWidth=IMAGE_WIDTH,
@@ -397,29 +326,21 @@ else:
             frameRate=FRAME_RATE,
         )
 
-        # 3. Start Threads
-        cameraThread = threading.Thread(target=camera_thread_func, args=(camera,))
-        controlThread = threading.Thread(
+        # Start Helper Threads
+        t_cam = Thread(target=camera_thread_func, args=(camera,))
+        t_net = Thread(target=receiver_thread_func, args=(client_socket,))
+        t_v2x = Thread(target=traffic_lights_status_thread)
+        t_ctrl = Thread(
             target=control_thread_func,
             args=(initialPose, waypointSequence, calibrationPose, calibrate),
         )
-        receiverThread = threading.Thread(
-            target=receiver_thread_func, args=(client_socket,)
-        )
-        # --- V2X ADDITION ---
-        trafficLightsThread = threading.Thread(target=traffic_lights_status_thread_func)
-        # --- End V2X ADDITION ---
 
-        cameraThread.start()
-        controlThread.start()
-        receiverThread.start()
-        # --- V2X ADDITION ---
-        trafficLightsThread.start()
-        # --- End V2X ADDITION ---
+        t_cam.start()
+        t_net.start()
+        t_v2x.start()
+        t_ctrl.start()
 
-        time.sleep(1.0)
-
-        # 4. Main sending loop
+        # Main Loop: Send Video
         while is_running:
             local_frame = None
             with frame_lock:
@@ -427,41 +348,26 @@ else:
                     local_frame = np.ascontiguousarray(latest_frame)
 
             if local_frame is not None:
-                # CHANGED: Compress frame to JPEG
-                # Quality goes from 0 to 100. 80 is a good balance of speed/quality.
                 encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
                 _, encoded_img = cv2.imencode(".jpg", local_frame, encode_param)
+                data = np.array(encoded_img).tobytes()
 
-                data = np.array(encoded_img)
-                frame_bytes = data.tobytes()
-
-                # Send the length of the COMPRESSED data
-                message_header = struct.pack(">L", len(frame_bytes))
-                client_socket.sendall(message_header)
-                client_socket.sendall(frame_bytes)
+                # Send size then data
+                try:
+                    client_socket.sendall(struct.pack(">L", len(data)))
+                    client_socket.sendall(data)
+                except:
+                    is_running = False
 
             time.sleep(0.02)
+
     except Exception as e:
-        print(f"An error occurred in the main thread: {e}")
+        print(f"Error: {e}")
     finally:
-        print("Cleaning up resources...")
         is_running = False
-
-        if controlThread and controlThread.is_alive():
-            controlThread.join()
-        if cameraThread and cameraThread.is_alive():
-            cameraThread.join()
-        if receiverThread and receiverThread.is_alive():
-            receiverThread.join()
-        # --- V2X ADDITION ---
-        if trafficLightsThread and trafficLightsThread.is_alive():
-            trafficLightsThread.join()
-        # --- End V2X ADDITION ---
-
-        if camera:
+        print("Shutting down...")
+        time.sleep(1)
+        if "camera" in locals():
             camera.terminate()
-        if client_socket:
+        if "client_socket" in locals():
             client_socket.close()
-
-        print("Shutdown complete.")
-        sys.exit(0)
