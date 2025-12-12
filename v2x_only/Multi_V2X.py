@@ -1,6 +1,7 @@
 import os
 import signal
 import numpy as np
+import threading
 from threading import Thread
 import time
 from pal.products.qcar import QCar, QCarGPS, IS_PHYSICAL_QCAR
@@ -8,13 +9,28 @@ from pal.utilities.math import wrap_to_pi
 from hal.content.qcar_functions import QCarEKF
 from hal.products.mats import SDCSRoadMap
 from pal.products.traffic_light import TrafficLight
+import math
+import socket
+import struct
+import cv2  # OpenCV for compression
+from pal.utilities.vision import Camera2D  # Helper for QCar Cameras
 
 # ================ Experiment Configuration ================
 # ===== Timing Parameters
 tf = 600
 startDelay = 1
 controllerUpdateRate = 100
-
+# ================ Camera & Streaming Config ================
+COMPUTER_IP = "192.168.2.11"  # <--- CHANGE THIS to your PC's IP address
+PORT = 8080
+CAMERA_ID = "3"  # "3" is usually the CSI Rear/Top camera
+IMAGE_WIDTH = 640
+IMAGE_HEIGHT = 480
+FRAME_RATE = 30
+is_running = True
+# Global Shared Resources for Camera
+latest_frame = None
+frame_lock = threading.Lock()
 # ===== Speed Controller Parameters
 v_cruise = 0.5
 K_p = 0.1
@@ -57,34 +73,88 @@ acceleration_rate = 0.1  # Rate of acceleration (m/s^2)
 stop_tolerance = 0.2  # Stop tolerance (meters)
 stop_distance_offset = 0.5  # Distance to stop before the target
 
+# Ensure math is imported at the top
 
-# Traffic light IP address
-TRAFFIC_LIGHT_IPS = ["192.168.2.19", "192.168.2.18"]  # Add more IPs as needed
-traffic_lights = [TrafficLight(ip) for ip in TRAFFIC_LIGHT_IPS]
+# 1. Define Traffic Light Configuration (IDs, IPs, and Rotations)
+# We add rotation here so the geofence knows which way the light is facing
+TRAFFIC_LIGHTS_CONFIG = [
+    {"id": 1, "ip": "192.168.2.15", "location": [2.113, 0.204], "yaw_deg": 0},
+    {"id": 2, "ip": "192.168.2.13", "location": [-1.909, 0.738], "yaw_deg": 180},
+]
+
+# 2. Initialize Traffic Lights using the config
+traffic_lights = [TrafficLight(cfg["ip"]) for cfg in TRAFFIC_LIGHTS_CONFIG]
+
+
+def generate_rotated_geofencing_areas(config_list):
+    """
+    Generates geofencing areas by applying rotation to local bounds.
+    SCALING_FACTOR (0.1) is manually applied here to the coordinates.
+    """
+    generated_areas = []
+
+    # --- UPDATED COORDINATES ---
+    # Original: (1.0, -9.0) and (-2.0, -13.0)
+    # Applied 0.1 scaling: (0.1, -0.9) and (-0.2, -1.3)
+    #
+    # We also widen the X range slightly (from 0.3m to 0.6m)
+    # to catch the car even if GPS drifts slightly sideways.
+
+    # Box: 0.9m to 1.5m in front of the light, 0.6m wide centered-ish
+    local_corner_1 = (0.3, -0.5)
+    local_corner_2 = (-0.3, -1.0)
+
+    for light in config_list:
+        center_x = light["location"][0]
+        center_y = light["location"][1]
+        yaw_rad = math.radians(light["yaw_deg"])
+
+        cos_yaw = math.cos(yaw_rad)
+        sin_yaw = math.sin(yaw_rad)
+
+        # Rotate local_corner_1
+        rot_x1 = local_corner_1[0] * cos_yaw - local_corner_1[1] * sin_yaw
+        rot_y1 = local_corner_1[0] * sin_yaw + local_corner_1[1] * cos_yaw
+        world_c1 = (center_x + rot_x1, center_y + rot_y1)
+
+        # Rotate local_corner_2
+        rot_x2 = local_corner_2[0] * cos_yaw - local_corner_2[1] * sin_yaw
+        rot_y2 = local_corner_2[0] * sin_yaw + local_corner_2[1] * cos_yaw
+        world_c2 = (center_x + rot_x2, center_y + rot_y2)
+
+        # Create AABB
+        x_min, x_max = min(world_c1[0], world_c2[0]), max(world_c1[0], world_c2[0])
+        y_min, y_max = min(world_c1[1], world_c2[1]), max(world_c1[1], world_c2[1])
+
+        # --- DEBUG PRINT ---
+        # This will verify the box is actually on your map (e.g., values < 3.0m)
+        print(
+            f"Created Geofence for Light {light['id']}: X[{x_min:.2f}, {x_max:.2f}], Y[{y_min:.2f}, {y_max:.2f}]"
+        )
+
+        generated_areas.append(
+            {
+                "name": f"Traffic Light {light['id']}",
+                "bounds": [(x_min, y_min), (x_max, y_max)],
+            }
+        )
+
+    return generated_areas
+
+
+# 3. Initialize the areas
+geofencing_areas = generate_rotated_geofencing_areas(TRAFFIC_LIGHTS_CONFIG)
+has_stopped_at = {area["name"]: False for area in geofencing_areas}
 
 # Setting the Traffic light sequence
-for traffic_light in traffic_lights:
-    traffic_light.timed(red=20, yellow=1, green=4)
+
 
 # Define geofencing areas as an array
 geofencing_threshold = 0.9
 traffic_light_positions = [(2.367, 0.9246), (-2.1248, 1.0018)]
 
 
-def generate_geofencing_areas(positions, threshold):
-    return [
-        {
-            "name": f"Traffic Light {i+1}",
-            "bounds": [(x - threshold, y - threshold), (x + threshold, y + threshold)],
-        }
-        for i, (x, y) in enumerate(positions)
-    ]
-
-
 def is_inside_geofence(position, geofence):
-    """
-    Check if a position is inside a given geofencing area.
-    """
     (x_min, y_min), (x_max, y_max) = geofence
     return x_min <= position[0] <= x_max and y_min <= position[1] <= y_max
 
@@ -177,13 +247,6 @@ class SteeringController:
         )
 
 
-# Multi-Traffic Light Stopping Logic
-geofencing_areas = generate_geofencing_areas(
-    traffic_light_positions, geofencing_threshold
-)
-has_stopped_at = {geofence["name"]: False for geofence in geofencing_areas}
-
-
 # def check_geofencing_and_stop(position):
 #     global v_ref, has_stopped_at
 
@@ -219,16 +282,11 @@ def get_traffic_lights_status():
             status = light.status()
             status_str = status_map.get(status, "UNKNOWN")
             statuses.append(status_str)
-            print(f"Traffic Light {i+1} Status: {status_str}")
+            # print(f"Traffic Light {i+1} Status: {status_str}")
         return statuses
     except Exception as e:
         print(f"Error fetching traffic light statuses: {e}")
         return ["UNKNOWN"] * len(traffic_lights)
-
-
-geofencing_areas = generate_geofencing_areas(
-    traffic_light_positions, geofencing_threshold
-)
 
 
 # def check_geofencing(position):
@@ -271,7 +329,7 @@ def controlLoop():
     else:
         gps = memoryview(b"")
     # endregion
-
+    last_print_time = 0
     with qcar, gps:
         t0 = time.time()
         t = 0
@@ -291,7 +349,7 @@ def controlLoop():
                     # Determine if we should stop
                     for i, geofence in enumerate(geofencing_areas):
                         if is_inside_geofence(position, geofence["bounds"]):
-                            print(f"Entered geofencing area of {geofence['name']}")
+                            # print(f"Entered geofencing area of {geofence['name']}")
                             traffic_light_status = traffic_light_statuses[i]
 
                             if (
@@ -340,6 +398,9 @@ def controlLoop():
                 x = ekf.x_hat[0, 0]
                 y = ekf.x_hat[1, 0]
                 th = ekf.x_hat[2, 0]
+                # if t - last_print_time > 0.5:
+                #     print(f"Car position: X={x:.3f}, Y={y:.3f}")
+                #     last_print_time = t
                 p = np.array([x, y]) + np.array([np.cos(th), np.sin(th)]) * 0.2
             v = qcar.motorTach
             # endregion
@@ -370,22 +431,79 @@ def controlLoop():
 
 
 # endregion
+def camera_thread_func(camera):
+    """Continuously reads from the camera into a global variable."""
+    global latest_frame, is_running
+    print("Camera thread started...")
+    while is_running:
+        if camera.read():
+            with frame_lock:
+                latest_frame = camera.imageData
+        time.sleep(1 / FRAME_RATE)
+    print("Camera thread stopped.")
+
 
 # region : Setup and run experiment
 if __name__ == "__main__":
+    # 1. Start existing threads
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    print(f"Connecting to computer at {COMPUTER_IP}:{PORT}...")
+    client_socket.connect((COMPUTER_IP, PORT))
+    print("Connection established.")
+
+    # 2. Initialize Camera
+    camera = Camera2D(
+        cameraId=CAMERA_ID,
+        frameWidth=IMAGE_WIDTH,
+        frameHeight=IMAGE_HEIGHT,
+        frameRate=FRAME_RATE,
+    )
+
     trafficLightsThread = Thread(target=traffic_lights_status_thread)
     trafficLightsThread.start()
+
     controlThread = Thread(target=controlLoop)
     controlThread.start()
 
+    # 2. Start NEW Camera threads
+    camThread = Thread(target=camera_thread_func, args=(camera,))
+    camThread.start()
+
+    while is_running:
+        local_frame = None
+        with frame_lock:
+            if latest_frame is not None:
+                local_frame = np.ascontiguousarray(latest_frame)
+
+        if local_frame is not None:
+            # Compression Logic
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+            _, encoded_img = cv2.imencode(".jpg", local_frame, encode_param)
+
+            data = np.array(encoded_img)
+            frame_bytes = data.tobytes()
+
+            # Send the length of the COMPRESSED data
+            message_header = struct.pack(">L", len(frame_bytes))
+            client_socket.sendall(message_header)
+            client_socket.sendall(frame_bytes)
+
+        time.sleep(0.02)
+
     try:
         while not KILL_THREAD:
-            time.sleep(0.01)
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("Stopping...")
+        KILL_THREAD = True
     finally:
         KILL_THREAD = True
         trafficLightsThread.join()
         controlThread.join()
-
-    input("Experiment complete. Press any key to exit...")
-
+        camThread.join()
+        if camera:
+            camera.terminate()
+        if client_socket:
+            client_socket.close()
+        print("All threads stopped.")
 # endregion
