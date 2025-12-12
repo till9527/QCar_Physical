@@ -73,6 +73,8 @@ def handle_client(conn, addr, model):
     found_pedestrian = False
     is_stopped_pedestrian = False
     last_pedestrian_seen_time = 0
+    is_stopped_qcar = False
+    last_qcar_seen_time = 0
 
     # NEW: Use the width threshold from your original file
     STOP_SIGN_MIN_WIDTH_THRESHOLD = 32
@@ -107,6 +109,7 @@ def handle_client(conn, addr, model):
             found_red_light = False
             found_stop_sign = False
             found_yield_sign = False
+            found_qcar = False
 
             for box in results[0].boxes:
                 class_name = model.names[int(box.cls[0].item())]
@@ -115,8 +118,14 @@ def handle_client(conn, addr, model):
                 height = xwyh[3].item()
                 y = xwyh[1].item()
                 x = xwyh[0].item()
+                if class_name == "Qcar":
+                    last_qcar_seen_time = current_time
                 if class_name == "pedestrian":
                     last_pedestrian_seen_time = current_time
+                if class_name == "Qcar" and height > 125:
+                    found_qcar = True
+                if class_name == "Qcar" and height < 125:
+                    found_qcar = False
 
                 if (
                     class_name == "pedestrian"
@@ -128,12 +137,12 @@ def handle_client(conn, addr, model):
                 if class_name == "pedestrian" and not 275 < x < 425:
                     found_pedestrian = False
 
-                if class_name == "red_light" and width > 13 and height < 50 and y < 200:
+                if class_name == "red_light" and width > 15 and height < 50 and y < 200:
                     found_red_light = True
 
                 if (
                     class_name == "yellow_light"
-                    and width > 13
+                    and width > 15
                     and height < 50
                     and y < 200
                 ):
@@ -141,7 +150,7 @@ def handle_client(conn, addr, model):
 
                 if (
                     class_name == "green_light"
-                    and width > 13
+                    and width > 15
                     and height < 50
                     and y < 200
                 ):
@@ -157,6 +166,7 @@ def handle_client(conn, addr, model):
             # NEW: This logic is now a clean if/elif chain for priority
 
             # A. Red Light Stop
+
             if found_pedestrian and car_state == "GO":
                 print(f"--- COMMAND to {addr}: Sending STOP (Pedestrian) ---")
                 conn.sendall(b"STOP")
@@ -176,6 +186,23 @@ def handle_client(conn, addr, model):
                 car_state = "GO"
                 is_stopped_pedestrian = False
 
+            elif found_qcar and car_state == "GO":
+                print(f"--- COMMAND to {addr}: Sending STOP (QCar) ---")
+                conn.sendall(b"STOP")
+                car_state = "STOP"
+                is_stopped_qcar = True
+
+            elif not found_qcar and car_state == "STOP" and is_stopped_qcar:
+                print(f"--- COMMAND to {addr}: Sending Go (QCar out of way) ---")
+                conn.sendall(b"GO")
+                car_state = "GO"
+                is_stopped_qcar = False
+
+            elif is_stopped_qcar and (current_time - last_qcar_seen_time > 5):
+                print(f"--- COMMAND to {addr}: Sending Go (QCar out of way) ---")
+                conn.sendall(b"GO")
+                car_state = "GO"
+                is_stopped_qcar = False
             elif (
                 found_red_light
                 and car_state == "GO"  # NEW: Only stop if we're not already stopped

@@ -19,12 +19,6 @@ from hal.content.qcar_functions import QCarEKF
 from hal.products.mats import SDCSRoadMap
 from pal.products.traffic_light import TrafficLight
 
-TRAFFIC_LIGHT_IPS = ["192.168.2.12", "192.168.2.11"]
-traffic_lights = [TrafficLight(ip) for ip in TRAFFIC_LIGHT_IPS]
-
-# Set a timed sequence for the physical traffic lights
-for traffic_light in traffic_lights:
-    traffic_light.timed(red=20, yellow=5, green=10)
 
 # --- Camera Settings ---
 CAMERA_ID = "3"
