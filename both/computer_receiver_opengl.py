@@ -145,6 +145,7 @@ def handle_client(conn, addr, model):
             found_stop_sign = False
             found_yield_sign = False
             found_qcar = False
+            found_pedestrian = False
 
             # (Parsing boxes - same as your original code)
             for box in results[0].boxes:
