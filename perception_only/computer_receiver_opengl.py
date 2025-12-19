@@ -173,13 +173,7 @@ def handle_client(conn, addr, model):
 
                 if class_name == "red_light" and width > 15 and height < 50 and y < 200:
                     found_red_light = True
-                if (
-                    class_name == "yellow_light"
-                    and width > 15
-                    and height < 50
-                    and y < 200
-                ):
-                    found_red_light = True
+                
                 if (
                     class_name == "green_light"
                     and width > 15

@@ -22,7 +22,7 @@ from pal.products.traffic_light import TrafficLight
 
 # ================= CONFIGURATION =================
 # --- Network (PC Connection) ---
-COMPUTER_IP = "192.168.2.11"  # <--- CONFIRM THIS IS YOUR PC IP
+COMPUTER_IP = "192.168.2.16"  # <--- CONFIRM THIS IS YOUR PC IP
 PORT = 8080
 
 # --- Camera ---
@@ -34,7 +34,7 @@ FRAME_RATE = 30
 # --- V2X / Traffic Lights ---
 TRAFFIC_LIGHTS_CONFIG = [
     {"id": 1, "ip": "192.168.2.15", "location": [2.113, 0.204], "yaw_deg": 0},
-    {"id": 2, "ip": "192.168.2.13", "location": [-1.909, 0.738], "yaw_deg": 180},
+    {"id": 2, "ip": "192.168.2.14", "location": [-1.909, 0.738], "yaw_deg": 180},
 ]
 
 # --- Controller ---
