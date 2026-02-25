@@ -21,7 +21,7 @@ tf = 600
 startDelay = 1
 controllerUpdateRate = 100
 # ================ Camera & Streaming Config ================
-COMPUTER_IP = "192.168.2.11"  # <--- CHANGE THIS to your PC's IP address
+COMPUTER_IP = "192.168.2.16"  # <--- CHANGE THIS to your PC's IP address
 PORT = 8080
 CAMERA_ID = "3"  # "3" is usually the CSI Rear/Top camera
 IMAGE_WIDTH = 640
@@ -79,7 +79,7 @@ stop_distance_offset = 0.5  # Distance to stop before the target
 # We add rotation here so the geofence knows which way the light is facing
 TRAFFIC_LIGHTS_CONFIG = [
     {"id": 1, "ip": "192.168.2.15", "location": [2.113, 0.204], "yaw_deg": 0},
-    {"id": 2, "ip": "192.168.2.13", "location": [-1.909, 0.738], "yaw_deg": 180},
+    {"id": 2, "ip": "192.168.2.14", "location": [-1.909, 0.738], "yaw_deg": 180},
 ]
 
 # 2. Initialize Traffic Lights using the config
@@ -101,8 +101,8 @@ def generate_rotated_geofencing_areas(config_list):
     # to catch the car even if GPS drifts slightly sideways.
 
     # Box: 0.9m to 1.5m in front of the light, 0.6m wide centered-ish
-    local_corner_1 = (0.3, -0.5)
-    local_corner_2 = (-0.3, -1.0)
+    local_corner_1 = (0.3, -0.3)
+    local_corner_2 = (-0.3, -0.8)
 
     for light in config_list:
         center_x = light["location"][0]

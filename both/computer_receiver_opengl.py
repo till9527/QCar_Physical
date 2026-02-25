@@ -63,8 +63,8 @@ def handle_client(conn, addr, model):
     stop_sign_start_time = 0
     yield_sign_start_time = 0
     is_stopped_for_yield = False
-    STOP_SIGN_WAIT_TIME_S = 5.0
-    STOP_SIGN_COOLDOWN_S = 10.0
+    STOP_SIGN_WAIT_TIME_S = 2.0
+    STOP_SIGN_COOLDOWN_S = 5.0
 
     # Red Light / Obstacle States
     is_stopped_light = False
@@ -76,7 +76,7 @@ def handle_client(conn, addr, model):
     is_stopped_qcar = False
     last_qcar_seen_time = 0
 
-    STOP_SIGN_MIN_WIDTH_THRESHOLD = 32
+    STOP_SIGN_MIN_WIDTH_THRESHOLD = 50
 
     try:
         while True:
@@ -290,7 +290,7 @@ def handle_client(conn, addr, model):
             if (
                 is_stopped_for_yield
                 and car_state == "STOP"
-                and (current_time - yield_sign_start_time > 3)
+                and (current_time - yield_sign_start_time > 0.5)
                 and not is_stopped_light
             ):
                 print(f"--- {addr}: GO (Yield Wait Over) ---")

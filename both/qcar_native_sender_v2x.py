@@ -66,8 +66,8 @@ def generate_rotated_geofencing_areas(config_list):
     generated_areas = []
     # Box dimensions relative to light: 0.3m to 0.8m in front, 0.6m wide
     # Note: Using the specific offsets found in your Multi_V2X.py
-    local_corner_1 = (0.3, -0.5)
-    local_corner_2 = (-0.3, -1.0)
+    local_corner_1 = (0.3, -0.3)
+    local_corner_2 = (-0.3, -0.8)
 
     for light in config_list:
         center_x = light["location"][0]
