@@ -140,7 +140,11 @@ def receiver_thread_func(sock):
                 if data:
                     command = data.decode("utf-8").strip()
                     # We accept the last valid command
-                    if "STOP" in command:
+                    if "FORCE_STOP" in command:
+                        cmd = "FORCE_STOP"
+                    elif "FORCE_GO" in command:
+                        cmd = "FORCE_GO"
+                    elif "STOP" in command:
                         cmd = "STOP"
                     elif "GO" in command:
                         cmd = "GO"
@@ -261,30 +265,33 @@ def control_thread_func(initialPose, waypointSequence, calibrationPose, calibrat
             target_speed = 0.0
 
             if t > startDelay:
-                # A. Check Perception Command (PC)
-                perception_says_go = False
+                # A. Check PC command (Auto or Manual Force)
                 with car_state_lock:
-                    if car_state == "GO":
-                        perception_says_go = True
+                    state = car_state
 
-                # B. Check V2X Command (Traffic Lights)
-                v2x_stop_override = False
-                current_pos = (x, y)
-
-                for i, geofence in enumerate(geofencing_areas):
-                    if is_inside_geofence(current_pos, geofence["bounds"]):
-                        # We are at a light, check its status
-                        status = traffic_light_statuses[i]
-                        if status == "RED":
-                            v2x_stop_override = True
-                            # Optional: Print only once to avoid spam
-                            # print(f"V2X Stop: {geofence['name']} is RED")
-
-                # C. Final Logic: Go only if PC says GO *AND* V2X doesn't override
-                if perception_says_go and not v2x_stop_override:
+                # B. Manual force modes bypass all other logic
+                if state == "FORCE_GO":
                     target_speed = v_cruise
-                else:
+                elif state == "FORCE_STOP":
                     target_speed = 0.0
+                else:
+                    # C. Auto mode arbitration: perception + V2X
+                    perception_says_go = state == "GO"
+
+                    v2x_stop_override = False
+                    current_pos = (x, y)
+
+                    for i, geofence in enumerate(geofencing_areas):
+                        if is_inside_geofence(current_pos, geofence["bounds"]):
+                            # We are at a light, check its status
+                            status = traffic_light_statuses[i]
+                            if status == "RED":
+                                v2x_stop_override = True
+
+                    if perception_says_go and not v2x_stop_override:
+                        target_speed = v_cruise
+                    else:
+                        target_speed = 0.0
 
                 # D. Update Controllers
                 u = speedController.update(v, target_speed, dt)

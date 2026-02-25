@@ -22,7 +22,7 @@ latest_frames = {}
 frames_lock = threading.Lock()
 
 # ### NEW: Dictionary to control client overrides from the main thread
-# Structure: { addr: {'force_go': False} }
+# Structure: { addr: {'force_go': False, 'force_stop': False} }
 client_controls = {}
 controls_lock = threading.Lock()
 
@@ -49,7 +49,7 @@ def handle_client(conn, addr, model):
 
     # ### NEW: Register this client in the controls dictionary
     with controls_lock:
-        client_controls[addr] = {"force_go": False}
+        client_controls[addr] = {"force_go": False, "force_stop": False}
 
     payload_size = struct.calcsize(">L")
 
@@ -102,16 +102,48 @@ def handle_client(conn, addr, model):
 
             # ### NEW: CHECK FOR MANUAL OVERRIDE ###
             force_go_active = False
+            force_stop_active = False
             with controls_lock:
                 if addr in client_controls:
                     force_go_active = client_controls[addr]["force_go"]
+                    force_stop_active = client_controls[addr]["force_stop"]
+
+            if force_stop_active:
+                # If manual override is ON, continuously force STOP and ignore all other logic
+                if car_state != "STOP":
+                    print(f"--- MANUAL OVERRIDE: Sending STOP to {addr} ---")
+                conn.sendall(b"FORCE_STOP")
+                car_state = "STOP"
+
+                # Reset internal logic flags so it doesn't get stuck when we switch back to Auto
+                is_stopped_pedestrian = False
+                is_stopped_qcar = False
+                is_stopped_light = False
+                is_stopped_for_sign = False
+                is_stopped_for_yield = False
+
+                # Visual indicator on frame for the override
+                cv2.putText(
+                    annotated_frame,
+                    "MANUAL OVERRIDE: STOP",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0, 0, 255),
+                    2,
+                )
+
+                # Update shared frame and SKIP the rest of the logic
+                with frames_lock:
+                    latest_frames[addr] = annotated_frame
+                continue
 
             if force_go_active:
-                # If manual override is ON, force state to GO and reset stop timers
-                if car_state == "STOP":
+                # If manual override is ON, continuously force GO and ignore all other logic
+                if car_state != "GO":
                     print(f"--- MANUAL OVERRIDE: Sending GO to {addr} ---")
-                    conn.sendall(b"GO")
-                    car_state = "GO"
+                conn.sendall(b"FORCE_GO")
+                car_state = "GO"
 
                 # Reset internal logic flags so it doesn't get stuck when we switch back to Auto
                 is_stopped_pedestrian = False
@@ -338,6 +370,7 @@ def main():
     print(f"Server on {PORT}.")
     print("--- CONTROLS ---")
     print("Press 'g' to FORCE GO (Manual Override)")
+    print("Press 's' to FORCE STOP (Manual Override)")
     print("Press 'a' to switch back to AUTO")
     print("Press 'q' to QUIT")
     print("----------------")
@@ -378,12 +411,21 @@ def main():
                 with controls_lock:
                     for addr in client_controls:
                         client_controls[addr]["force_go"] = True
+                        client_controls[addr]["force_stop"] = False
+
+            elif key == ord("s"):
+                print(">>> UI COMMAND: Enabling Force STOP")
+                with controls_lock:
+                    for addr in client_controls:
+                        client_controls[addr]["force_stop"] = True
+                        client_controls[addr]["force_go"] = False
 
             elif key == ord("a"):
                 print(">>> UI COMMAND: Re-enabling AUTO Mode")
                 with controls_lock:
                     for addr in client_controls:
                         client_controls[addr]["force_go"] = False
+                        client_controls[addr]["force_stop"] = False
 
             if not accept_thread.is_alive() and not active_windows:
                 # Keep running if thread is alive but no clients yet
