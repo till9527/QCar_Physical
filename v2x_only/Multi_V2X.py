@@ -12,6 +12,7 @@ from pal.products.traffic_light import TrafficLight
 import math
 import socket
 import struct
+import select
 import cv2  # OpenCV for compression
 from pal.utilities.vision import Camera2D  # Helper for QCar Cameras
 
@@ -31,6 +32,12 @@ is_running = True
 # Global Shared Resources for Camera
 latest_frame = None
 frame_lock = threading.Lock()
+
+# Shared command state from computer receiver
+car_state = "GO"
+car_state_lock = threading.Lock()
+last_force_cmd_time = 0.0
+FORCE_CMD_TIMEOUT_S = 1.0
 # ===== Speed Controller Parameters
 v_cruise = 0.5
 K_p = 0.1
@@ -84,6 +91,11 @@ TRAFFIC_LIGHTS_CONFIG = [
 
 # 2. Initialize Traffic Lights using the config
 traffic_lights = [TrafficLight(cfg["ip"]) for cfg in TRAFFIC_LIGHTS_CONFIG]
+traffic_light_statuses = ["UNKNOWN"] * len(TRAFFIC_LIGHTS_CONFIG)
+traffic_light_status_times = [0.0] * len(TRAFFIC_LIGHTS_CONFIG)
+traffic_light_lock = threading.Lock()
+TRAFFIC_LIGHT_POLL_INTERVAL_S = 0.1
+TRAFFIC_LIGHT_STALE_THRESHOLD_S = 1.0
 
 
 def generate_rotated_geofencing_areas(config_list):
@@ -144,19 +156,18 @@ def generate_rotated_geofencing_areas(config_list):
 
 # 3. Initialize the areas
 geofencing_areas = generate_rotated_geofencing_areas(TRAFFIC_LIGHTS_CONFIG)
-has_stopped_at = {area["name"]: False for area in geofencing_areas}
-
-# Setting the Traffic light sequence
-
-
-# Define geofencing areas as an array
-geofencing_threshold = 0.9
-traffic_light_positions = [(2.367, 0.9246), (-2.1248, 1.0018)]
 
 
 def is_inside_geofence(position, geofence):
     (x_min, y_min), (x_max, y_max) = geofence
     return x_min <= position[0] <= x_max and y_min <= position[1] <= y_max
+
+
+def is_inside_geofence_padded(position, geofence, padding=0.0):
+    (x_min, y_min), (x_max, y_max) = geofence
+    return (x_min - padding) <= position[0] <= (x_max + padding) and (
+        y_min - padding
+    ) <= position[1] <= (y_max + padding)
 
 
 # Used to enable safe keyboard triggered shutdown
@@ -166,8 +177,9 @@ v_ref = v_cruise
 
 
 def sig_handler(*args):
-    global KILL_THREAD
+    global KILL_THREAD, is_running
     KILL_THREAD = True
+    is_running = False
 
 
 signal.signal(signal.SIGINT, sig_handler)
@@ -270,49 +282,73 @@ class SteeringController:
 #             has_stopped_at[name] = False
 
 
-def get_traffic_lights_status():
-    """
-    Fetch real-time status for multiple traffic lights.
-    """
-    try:
-        status_map = {"1": "RED", "2": "YELLOW", "3": "GREEN"}
-        statuses = []
-
-        for i, light in enumerate(traffic_lights):
-            status = light.status()
-            status_str = status_map.get(status, "UNKNOWN")
-            statuses.append(status_str)
-            # print(f"Traffic Light {i+1} Status: {status_str}")
-        return statuses
-    except Exception as e:
-        print(f"Error fetching traffic light statuses: {e}")
-        return ["UNKNOWN"] * len(traffic_lights)
-
-
-# def check_geofencing(position):
-#     for geofence in geofencing_areas:
-#         if is_inside_geofence(position, geofence["bounds"]):
-#             print(f"Entered geofencing area of {geofence['name']}")
-#             return
-
-
 def traffic_lights_status_thread():
-    global traffic_light_statuses
-    while not KILL_THREAD:
-        # print("Traffic Light Status Thread Running...")
-        traffic_light_statuses = get_traffic_lights_status()
-        time.sleep(1)  # Adjust frequency of updates as needed
+    global traffic_light_statuses, traffic_light_status_times
+    status_map = {"1": "RED", "2": "YELLOW", "3": "GREEN"}
+    while is_running and (not KILL_THREAD):
+        for i, light in enumerate(traffic_lights):
+            try:
+                s = light.status()
+                mapped_status = status_map.get(s, "UNKNOWN")
+            except Exception:
+                mapped_status = "UNKNOWN"
+
+            now = time.time()
+            with traffic_light_lock:
+                traffic_light_statuses[i] = mapped_status
+                traffic_light_status_times[i] = now
+
+        time.sleep(TRAFFIC_LIGHT_POLL_INTERVAL_S)
+
+
+def receiver_thread_func(sock):
+    """Receives STOP/GO/FORCE commands from the computer receiver."""
+    global is_running, car_state, KILL_THREAD, last_force_cmd_time
+    print("Receiver thread started...")
+    while is_running and (not KILL_THREAD):
+        readable, _, _ = select.select([sock], [], [], 1.0)
+        if sock in readable:
+            try:
+                data = sock.recv(1024)
+                if data:
+                    command = data.decode("utf-8").strip()
+                    if "FORCE_STOP" in command:
+                        cmd = "FORCE_STOP"
+                    elif "FORCE_GO" in command:
+                        cmd = "FORCE_GO"
+                    elif "STOP" in command:
+                        cmd = "STOP"
+                    elif "GO" in command:
+                        cmd = "GO"
+                    else:
+                        cmd = None
+
+                    if cmd:
+                        with car_state_lock:
+                            car_state = cmd
+                            if cmd in ("FORCE_GO", "FORCE_STOP"):
+                                last_force_cmd_time = time.time()
+                else:
+                    is_running = False
+                    KILL_THREAD = True
+                    break
+            except Exception:
+                is_running = False
+                KILL_THREAD = True
+                break
+    print("Receiver thread stopped.")
 
 
 def controlLoop():
     # region controlLoop setup
-    global KILL_THREAD
+    global KILL_THREAD, is_running, car_state
     u = 0
     delta = 0
     countMax = controllerUpdateRate / 10
     count = 0
-    v_ref = v_cruise
-    traffic_light_status = "unknown"
+    geofence_padding_m = 0.15
+    last_geofence_name = None
+    last_geofence_log_time = 0
     # endregion
 
     # region Controller initialization
@@ -329,11 +365,10 @@ def controlLoop():
     else:
         gps = memoryview(b"")
     # endregion
-    last_print_time = 0
     with qcar, gps:
         t0 = time.time()
         t = 0
-        while (t < tf + startDelay) and (not KILL_THREAD):
+        while (t < tf + startDelay) and (not KILL_THREAD) and is_running:
             # region : Loop timing update
             tp = t
             t = time.time() - t0
@@ -343,41 +378,9 @@ def controlLoop():
             # region : Read from sensors and update state estimates
             qcar.read()
             if enableSteeringControl:
+                gps_position = None
                 if gps.readGPS():
-                    position = (gps.position[0], gps.position[1])
-
-                    # Determine if we should stop
-                    for i, geofence in enumerate(geofencing_areas):
-                        if is_inside_geofence(position, geofence["bounds"]):
-                            # print(f"Entered geofencing area of {geofence['name']}")
-                            traffic_light_status = traffic_light_statuses[i]
-
-                            if (
-                                traffic_light_status == "RED"
-                                and not has_stopped_at[geofence["name"]]
-                            ):
-                                v_ref = 0  # STOP
-                                has_stopped_at[geofence["name"]] = True
-                                print(
-                                    f"Stopping at {geofence['name']} due to RED light!"
-                                )
-
-                            elif (
-                                traffic_light_status == "GREEN"
-                                and has_stopped_at[geofence["name"]]
-                            ):
-                                v_ref = v_cruise  # RESUME
-                                has_stopped_at[geofence["name"]] = False
-                                print(
-                                    f"Traffic light at {geofence['name']} turned GREEN. Resuming movement."
-                                )
-
-                        if (
-                            not is_inside_geofence(position, geofence["bounds"])
-                            and has_stopped_at[geofence["name"]]
-                        ):
-                            has_stopped_at[geofence["name"]] = False  # Reset stop state
-
+                    gps_position = (gps.position[0], gps.position[1])
                     y_gps = np.array(
                         [gps.position[0], gps.position[1], gps.orientation[2]]
                     )
@@ -398,9 +401,6 @@ def controlLoop():
                 x = ekf.x_hat[0, 0]
                 y = ekf.x_hat[1, 0]
                 th = ekf.x_hat[2, 0]
-                # if t - last_print_time > 0.5:
-                #     print(f"Car position: X={x:.3f}, Y={y:.3f}")
-                #     last_print_time = t
                 p = np.array([x, y]) + np.array([np.cos(th), np.sin(th)]) * 0.2
             v = qcar.motorTach
             # endregion
@@ -410,9 +410,63 @@ def controlLoop():
                 u = 0
                 delta = 0
             else:
-                # region : Speed controller update
-                u = speedController.update(v, v_ref, dt)
-                # endregion
+                with car_state_lock:
+                    state = car_state
+                    if (
+                        state in ("FORCE_GO", "FORCE_STOP")
+                        and (time.time() - last_force_cmd_time) > FORCE_CMD_TIMEOUT_S
+                    ):
+                        car_state = "GO"
+                        state = "GO"
+                        print("Force mode expired -> AUTO")
+
+                v2x_stop_override = False
+                current_pos = gps_position if gps_position is not None else (x, y)
+                current_geofence_name = None
+                current_geofence_status = "UNKNOWN"
+
+                for i, geofence in enumerate(geofencing_areas):
+                    if is_inside_geofence_padded(
+                        current_pos, geofence["bounds"], geofence_padding_m
+                    ):
+                        current_geofence_name = geofence["name"]
+                        with traffic_light_lock:
+                            status = traffic_light_statuses[i]
+                            status_age = time.time() - traffic_light_status_times[i]
+
+                        if status_age > TRAFFIC_LIGHT_STALE_THRESHOLD_S:
+                            status = "UNKNOWN"
+
+                        current_geofence_status = status
+                        if status == "RED":
+                            v2x_stop_override = True
+
+                now = time.time()
+                if current_geofence_name is not None:
+                    if (
+                        current_geofence_name != last_geofence_name
+                        or (now - last_geofence_log_time) > 1.0
+                    ):
+                        print(
+                            f"Inside {current_geofence_name} | pos=({current_pos[0]:.2f}, {current_pos[1]:.2f}) | light={current_geofence_status}"
+                        )
+                        last_geofence_log_time = now
+                    last_geofence_name = current_geofence_name
+                else:
+                    last_geofence_name = None
+
+                if state == "FORCE_GO":
+                    target_speed = v_cruise
+                elif state == "FORCE_STOP":
+                    target_speed = 0.0
+                else:
+                    perception_says_go = state == "GO"
+                    if perception_says_go and not v2x_stop_override:
+                        target_speed = v_cruise
+                    else:
+                        target_speed = 0.0
+
+                u = speedController.update(v, target_speed, dt)
 
                 # region : Steering controller update
                 if enableSteeringControl:
@@ -428,6 +482,9 @@ def controlLoop():
             if count >= countMax and t > startDelay:
                 count = 0
                 continue
+
+    qcar.write(0, 0)
+    is_running = False
 
 
 # endregion
@@ -462,6 +519,9 @@ if __name__ == "__main__":
     trafficLightsThread = Thread(target=traffic_lights_status_thread)
     trafficLightsThread.start()
 
+    receiverThread = Thread(target=receiver_thread_func, args=(client_socket,))
+    receiverThread.start()
+
     controlThread = Thread(target=controlLoop)
     controlThread.start()
 
@@ -469,38 +529,34 @@ if __name__ == "__main__":
     camThread = Thread(target=camera_thread_func, args=(camera,))
     camThread.start()
 
-    while is_running:
-        local_frame = None
-        with frame_lock:
-            if latest_frame is not None:
-                local_frame = np.ascontiguousarray(latest_frame)
-
-        if local_frame is not None:
-            # Compression Logic
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
-            _, encoded_img = cv2.imencode(".jpg", local_frame, encode_param)
-
-            data = np.array(encoded_img)
-            frame_bytes = data.tobytes()
-
-            # Send the length of the COMPRESSED data
-            message_header = struct.pack(">L", len(frame_bytes))
-            client_socket.sendall(message_header)
-            client_socket.sendall(frame_bytes)
-
-        time.sleep(0.02)
-
     try:
-        while not KILL_THREAD:
-            time.sleep(0.1)
-    except KeyboardInterrupt:
-        print("Stopping...")
-        KILL_THREAD = True
+        while is_running and (not KILL_THREAD):
+            local_frame = None
+            with frame_lock:
+                if latest_frame is not None:
+                    local_frame = np.ascontiguousarray(latest_frame)
+
+            if local_frame is not None:
+                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                _, encoded_img = cv2.imencode(".jpg", local_frame, encode_param)
+
+                data = np.array(encoded_img)
+                frame_bytes = data.tobytes()
+
+                message_header = struct.pack(">L", len(frame_bytes))
+                client_socket.sendall(message_header)
+                client_socket.sendall(frame_bytes)
+
+            time.sleep(0.02)
+    except Exception as e:
+        print(f"Error: {e}")
     finally:
         KILL_THREAD = True
+        is_running = False
         trafficLightsThread.join()
         controlThread.join()
         camThread.join()
+        receiverThread.join()
         if camera:
             camera.terminate()
         if client_socket:

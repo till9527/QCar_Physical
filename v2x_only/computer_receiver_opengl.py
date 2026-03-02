@@ -22,6 +22,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 latest_frames = {}
 frames_lock = threading.Lock()
 
+# Manual override controls per client
+# Structure: { addr: {'force_go': False, 'force_stop': False} }
+client_controls = {}
+controls_lock = threading.Lock()
+
 
 # --- Helper function (Unchanged) ---
 def receive_all(sock, n):
@@ -53,6 +58,10 @@ def handle_client(conn, addr):
     and places the annotated frame in a shared dictionary for display.
     """
     print(f"Thread started for client: {addr}")
+
+    with controls_lock:
+        client_controls[addr] = {"force_go": False, "force_stop": False}
+
     payload_size = struct.calcsize(">L")
 
     try:
@@ -74,6 +83,42 @@ def handle_client(conn, addr):
             if frame is None:
                 continue
 
+            force_go_active = False
+            force_stop_active = False
+            with controls_lock:
+                if addr in client_controls:
+                    force_go_active = client_controls[addr]["force_go"]
+                    force_stop_active = client_controls[addr]["force_stop"]
+
+            if force_stop_active:
+                try:
+                    conn.sendall(b"FORCE_STOP")
+                except socket.error:
+                    break
+                cv2.putText(
+                    frame,
+                    "MANUAL OVERRIDE: STOP",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0, 0, 255),
+                    2,
+                )
+            elif force_go_active:
+                try:
+                    conn.sendall(b"FORCE_GO")
+                except socket.error:
+                    break
+                cv2.putText(
+                    frame,
+                    "MANUAL OVERRIDE: GO",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0, 255, 0),
+                    2,
+                )
+
             # --- 5. Update Shared Frame ---
             with frames_lock:
                 latest_frames[addr] = frame
@@ -86,6 +131,9 @@ def handle_client(conn, addr):
         with frames_lock:
             if addr in latest_frames:
                 del latest_frames[addr]
+        with controls_lock:
+            if addr in client_controls:
+                del client_controls[addr]
         conn.close()
 
 
@@ -108,7 +156,13 @@ def main():
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((HOST, PORT))
     server_socket.listen()
-    print(f"Server listening on port {PORT}... Press 'q' in any video window to quit.")
+    print(f"Server listening on port {PORT}.")
+    print("--- CONTROLS ---")
+    print("Press 'g' to FORCE GO (Manual Override)")
+    print("Press 's' to FORCE STOP (Manual Override)")
+    print("Press 'a' to switch back to AUTO")
+    print("Press 'q' to QUIT")
+    print("----------------")
 
     accept_thread = threading.Thread(target=accept_connections, args=(server_socket,))
     accept_thread.daemon = True
@@ -137,10 +191,32 @@ def main():
                 cv2.destroyWindow(window_name)
             active_windows = current_windows
 
-            # Wait for a key press. This also allows OpenCV to process its GUI events.
-            # Press 'q' to quit the entire application.
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            # Wait for keyboard input.
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord("q"):
                 running = False
+
+            elif key == ord("g"):
+                print(">>> UI COMMAND: Enabling Force GO")
+                with controls_lock:
+                    for addr in client_controls:
+                        client_controls[addr]["force_go"] = True
+                        client_controls[addr]["force_stop"] = False
+
+            elif key == ord("s"):
+                print(">>> UI COMMAND: Enabling Force STOP")
+                with controls_lock:
+                    for addr in client_controls:
+                        client_controls[addr]["force_stop"] = True
+                        client_controls[addr]["force_go"] = False
+
+            elif key == ord("a"):
+                print(">>> UI COMMAND: Re-enabling AUTO Mode")
+                with controls_lock:
+                    for addr in client_controls:
+                        client_controls[addr]["force_go"] = False
+                        client_controls[addr]["force_stop"] = False
 
             # If the server thread stops, we should also exit
             if not accept_thread.is_alive() and not active_windows:

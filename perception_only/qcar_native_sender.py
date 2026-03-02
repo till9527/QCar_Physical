@@ -21,7 +21,7 @@ from hal.content.qcar_functions import QCarEKF
 from hal.products.mats import SDCSRoadMap
 
 # --- Networking Setup ---
-COMPUTER_IP = "192.168.2.11"
+COMPUTER_IP = "192.168.2.16"
 PORT = 8080
 
 
@@ -133,9 +133,20 @@ def receiver_thread_func(sock):
                 if data:
                     command = data.decode("utf-8").strip()
                     print(f"RECEIVED COMMAND: {command}")
-                    if command in ["GO", "STOP"]:
+                    if "FORCE_STOP" in command:
+                        cmd = "FORCE_STOP"
+                    elif "FORCE_GO" in command:
+                        cmd = "FORCE_GO"
+                    elif "STOP" in command:
+                        cmd = "STOP"
+                    elif "GO" in command:
+                        cmd = "GO"
+                    else:
+                        cmd = None
+
+                    if cmd:
                         with car_state_lock:
-                            car_state = command
+                            car_state = cmd
                 else:
                     print("Receiver thread: Connection closed by computer.")
                     is_running = False
@@ -202,10 +213,15 @@ def control_thread_func(initialPose, waypointSequence, calibrationPose, calibrat
                 u, delta = 0, 0
             else:
                 # MODIFICATION: Adjust speed based on the received command
-                target_speed = 0.0
                 with car_state_lock:
-                    if car_state == "GO":
-                        target_speed = v_ref
+                    state = car_state
+
+                if state == "FORCE_GO":
+                    target_speed = v_ref
+                elif state == "FORCE_STOP":
+                    target_speed = 0.0
+                else:
+                    target_speed = v_ref if state == "GO" else 0.0
 
                 u = speedController.update(v, target_speed, dt)
 
